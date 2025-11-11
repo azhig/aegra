@@ -2,6 +2,7 @@
 
 import asyncio
 import contextlib
+import os
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Any
@@ -25,6 +26,7 @@ from ..core.sse import create_end_event, get_sse_headers
 from ..models import Run, RunCreate, RunStatus, User
 from ..services.langgraph_service import create_run_config, get_langgraph_service
 from ..services.streaming_service import streaming_service
+from ..services.task_queue import get_task_queue
 from ..utils.assistants import resolve_assistant_id
 from ..utils.run_utils import (
     _filter_context_by_schema,
@@ -228,31 +230,64 @@ async def create_run(
         error_message=None,
     )
 
-    # Start execution asynchronously
-    # Don't pass the session to avoid transaction conflicts
-    task = asyncio.create_task(
-        execute_run_async(
-            run_id,
-            thread_id,
-            assistant.graph_id,
-            request.input or {},
-            user,
-            config,
-            context,
-            request.stream_mode,
-            None,  # Don't pass session to avoid conflicts
-            request.checkpoint,
-            request.command,
-            request.interrupt_before,
-            request.interrupt_after,
-            request.multitask_strategy,
-            request.stream_subgraphs,
+    # Check if worker mode is enabled
+    enable_workers = os.getenv("ENABLE_WORKERS", "false").lower() == "true"
+
+    if enable_workers:
+        # Enqueue task for worker execution
+        try:
+            task_queue = await get_task_queue()
+            await task_queue.enqueue(
+                run_id=run_id,
+                thread_id=thread_id,
+                graph_id=assistant.graph_id,
+                input_data=request.input or {},
+                user_identity=user.identity,
+                config=config,
+                context=context,
+                stream_mode=request.stream_mode,
+                checkpoint=request.checkpoint,
+                command=request.command,
+                interrupt_before=request.interrupt_before,
+                interrupt_after=request.interrupt_after,
+                multitask_strategy=request.multitask_strategy,
+                stream_subgraphs=request.stream_subgraphs,
+            )
+            logger.info(
+                f"[create_run] task enqueued for worker execution run_id={run_id}"
+            )
+        except Exception as e:
+            logger.error(f"[create_run] failed to enqueue task: {e}", exc_info=e)
+            # Fallback to direct execution
+            logger.warning("[create_run] falling back to direct execution")
+            enable_workers = False
+
+    if not enable_workers:
+        # Start execution asynchronously in current process
+        # Don't pass the session to avoid transaction conflicts
+        task = asyncio.create_task(
+            execute_run_async(
+                run_id,
+                thread_id,
+                assistant.graph_id,
+                request.input or {},
+                user,
+                config,
+                context,
+                request.stream_mode,
+                None,  # Don't pass session to avoid conflicts
+                request.checkpoint,
+                request.command,
+                request.interrupt_before,
+                request.interrupt_after,
+                request.multitask_strategy,
+                request.stream_subgraphs,
+            )
         )
-    )
-    logger.info(
-        f"[create_run] background task created task_id={id(task)} for run_id={run_id}"
-    )
-    active_runs[run_id] = task
+        logger.info(
+            f"[create_run] background task created task_id={id(task)} for run_id={run_id}"
+        )
+        active_runs[run_id] = task
 
     return run
 

@@ -38,8 +38,10 @@ from .middleware import DoubleEncodedJSONMiddleware, StructLogMiddleware
 from .models.errors import AgentProtocolError, get_error_type
 from .observability.base import get_observability_manager
 from .observability.langfuse_integration import _langfuse_provider
+from .services.broker_factory import initialize_broker_manager, shutdown_broker_manager
 from .services.event_store import event_store
 from .services.langgraph_service import get_langgraph_service
+from .services.sweeper import start_sweeper, stop_sweeper
 from .utils.setup_logging import setup_logging
 
 # Task management for run cancellation
@@ -63,8 +65,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     langgraph_service = get_langgraph_service()
     await langgraph_service.initialize()
 
+    # Initialize broker manager for streaming
+    await initialize_broker_manager()
+
     # Initialize event store cleanup task
     await event_store.start_cleanup_task()
+
+    # Start run sweeper for worker fault tolerance (only if workers enabled)
+    enable_workers = os.getenv("ENABLE_WORKERS", "false").lower() == "true"
+    if enable_workers:
+        await start_sweeper()
 
     yield
 
@@ -75,6 +85,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
 
     # Stop event store cleanup task
     await event_store.stop_cleanup_task()
+
+    # Stop run sweeper
+    if enable_workers:
+        await stop_sweeper()
+
+    # Shutdown broker manager
+    await shutdown_broker_manager()
 
     await db_manager.close()
 

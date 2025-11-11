@@ -9,7 +9,7 @@ import structlog
 from ..core.sse import create_error_event, create_metadata_event
 from ..models import Run
 from ..utils import extract_event_sequence, generate_event_id
-from .broker import broker_manager
+from .broker_factory import get_broker_manager
 from .event_converter import EventConverter
 from .event_store import event_store, store_sse_event
 
@@ -67,6 +67,7 @@ class StreamingService:
         only_interrupt_updates: bool = False,
     ):
         """Put an event into the run's broker queue for live consumers"""
+        broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
         self._next_event_counter(run_id, event_id)
 
@@ -149,6 +150,7 @@ class StreamingService:
         self.event_counters[run_id] = counter
         event_id = generate_event_id(run_id, counter)
 
+        broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
         if broker:
             await broker.put(event_id, ("end", {"status": "cancelled"}))
@@ -161,6 +163,7 @@ class StreamingService:
         self.event_counters[run_id] = counter
         event_id = generate_event_id(run_id, counter)
 
+        broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
         if broker:
             await broker.put(
@@ -228,6 +231,7 @@ class StreamingService:
     ) -> AsyncIterator[str]:
         """Stream live events from broker"""
         run_id = run.run_id
+        broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
 
         # If run finished and broker is done, nothing to stream
@@ -299,13 +303,15 @@ class StreamingService:
         except Exception as e:
             logger.error(f"Error updating run status for {run_id}: {e}")
 
-    def is_run_streaming(self, run_id: str) -> bool:
+    async def is_run_streaming(self, run_id: str) -> bool:
         """Check if run is currently active (has a broker)"""
+        broker_manager = await get_broker_manager()
         broker = broker_manager.get_broker(run_id)
         return broker is not None and not broker.is_finished()
 
     async def cleanup_run(self, run_id: str):
         """Clean up streaming resources for a run"""
+        broker_manager = await get_broker_manager()
         broker_manager.cleanup_broker(run_id)
 
     def _stored_event_to_sse(self, run_id: str, ev) -> str | None:

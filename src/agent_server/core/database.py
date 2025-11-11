@@ -6,6 +6,7 @@ from typing import Any
 import structlog
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.store.postgres.aio import AsyncPostgresStore
+from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 
 logger = structlog.get_logger(__name__)
@@ -20,9 +21,11 @@ class DatabaseManager:
         self._checkpointer_cm: Any = None  # holds the contextmanager so we can close it
         self._store: AsyncPostgresStore | None = None
         self._store_cm: Any = None
+        self._redis_client: Redis | None = None
         self._database_url = os.getenv(
             "DATABASE_URL", "postgresql+asyncpg://user:password@localhost:5432/aegra"
         )
+        self._redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
 
     async def initialize(self) -> None:
         """Initialize database connections and LangGraph components"""
@@ -63,6 +66,11 @@ class DatabaseManager:
             self._store_cm = None
             self._store = None
 
+        # Close Redis client
+        if self._redis_client is not None:
+            await self._redis_client.aclose()
+            self._redis_client = None
+
         logger.info("✅ Database connections closed")
 
     async def get_checkpointer(self) -> AsyncPostgresSaver:
@@ -101,6 +109,32 @@ class DatabaseManager:
         if not self.engine:
             raise RuntimeError("Database not initialized")
         return self.engine
+
+    async def get_redis_client(self) -> Redis:
+        """Get Redis client for PubSub and task queue.
+
+        Returns a lazily-initialized Redis client. The client is created
+        on first access and cached for subsequent calls.
+        """
+        if self._redis_client is None:
+            self._redis_client = Redis.from_url(
+                self._redis_url,
+                encoding="utf-8",
+                decode_responses=True,
+            )
+            # Test connection
+            try:
+                await self._redis_client.ping()
+                logger.info("✅ Redis client connected", redis_url=self._redis_url)
+            except Exception as e:
+                logger.warning(
+                    "⚠️ Redis connection failed, will retry on next access",
+                    error=str(e),
+                )
+                await self._redis_client.aclose()
+                self._redis_client = None
+                raise
+        return self._redis_client
 
 
 # Global database manager instance
