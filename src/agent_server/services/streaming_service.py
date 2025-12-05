@@ -6,7 +6,7 @@ from typing import Any
 
 import structlog
 
-from ..core.sse import create_error_event, create_metadata_event
+from ..core.sse import create_error_event
 from ..models import Run
 from ..utils import extract_event_sequence, generate_event_id
 from .broker_factory import get_broker_manager
@@ -17,35 +17,11 @@ logger = structlog.getLogger(__name__)
 
 
 class StreamingService:
-    """Service to handle SSE streaming orchestration with LangGraph compatibility"""
+    """Service to handle SSE streaming orchestration"""
 
     def __init__(self):
         self.event_counters: dict[str, int] = {}
         self.event_converter = EventConverter()
-
-    def _process_interrupt_updates(
-        self, raw_event: Any, only_interrupt_updates: bool
-    ) -> tuple[Any, bool]:
-        """Process interrupt updates logic - returns (processed_event, should_skip)"""
-        if (
-            isinstance(raw_event, tuple)
-            and len(raw_event) >= 2
-            and raw_event[0] == "updates"
-            and only_interrupt_updates
-        ):
-            # User didn't request updates - only process interrupt updates
-            if (
-                isinstance(raw_event[1], dict)
-                and "__interrupt__" in raw_event[1]
-                and len(raw_event[1].get("__interrupt__", [])) > 0
-            ):
-                # Convert interrupt updates to values events
-                return ("values", raw_event[1]), False
-            else:
-                # Skip non-interrupt updates when not requested
-                return raw_event, True
-        else:
-            return raw_event, False
 
     def _next_event_counter(self, run_id: str, event_id: str) -> int:
         """Update and return the next event counter for a run"""
@@ -64,34 +40,27 @@ class StreamingService:
         run_id: str,
         event_id: str,
         raw_event: Any,
-        only_interrupt_updates: bool = False,
     ):
-        """Put an event into the run's broker queue for live consumers"""
+        """Put an event into the run's broker queue for live consumers
+
+        Note: Events from graph_streaming are already filtered, so they pass through as-is.
+        """
         broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
         self._next_event_counter(run_id, event_id)
-
-        processed_event, should_skip = self._process_interrupt_updates(
-            raw_event, only_interrupt_updates
-        )
-        if should_skip:
-            return
-
-        await broker.put(event_id, processed_event)
+        await broker.put(event_id, raw_event)
 
     async def store_event_from_raw(
         self,
         run_id: str,
         event_id: str,
         raw_event: Any,
-        only_interrupt_updates: bool = False,
     ):
-        """Convert raw event to stored format and store it"""
-        processed_event, should_skip = self._process_interrupt_updates(
-            raw_event, only_interrupt_updates
-        )
-        if should_skip:
-            return
+        """Convert raw event to stored format and store it
+
+        Note: Events from graph_streaming are already filtered, so they pass through as-is.
+        """
+        processed_event = raw_event
 
         # Parse the processed event
         node_path = None
@@ -124,6 +93,49 @@ class StreamingService:
                     "node_path": node_path,
                 },
             )
+        elif stream_mode_label == "messages/partial":
+            await store_sse_event(
+                run_id,
+                event_id,
+                "messages/partial",
+                {
+                    "type": "messages_partial",
+                    "messages": event_payload,
+                    "node_path": node_path,
+                },
+            )
+        elif stream_mode_label == "messages/complete":
+            await store_sse_event(
+                run_id,
+                event_id,
+                "messages/complete",
+                {
+                    "type": "messages_complete",
+                    "messages": event_payload,
+                    "node_path": node_path,
+                },
+            )
+        elif stream_mode_label == "messages/metadata":
+            await store_sse_event(
+                run_id,
+                event_id,
+                "messages/metadata",
+                {
+                    "type": "messages_metadata",
+                    "metadata": event_payload,
+                    "node_path": node_path,
+                },
+            )
+        elif stream_mode_label == "events":
+            await store_sse_event(
+                run_id,
+                event_id,
+                "events",
+                {
+                    "type": "langchain_event",
+                    "event": event_payload,
+                },
+            )
         elif stream_mode_label == "values" or stream_mode_label == "updates":
             await store_sse_event(
                 run_id,
@@ -138,7 +150,7 @@ class StreamingService:
                 "end",
                 {
                     "type": "run_complete",
-                    "status": event_payload.get("status", "completed"),
+                    "status": event_payload.get("status", "success"),
                     "final_output": event_payload.get("final_output"),
                 },
             )
@@ -153,7 +165,7 @@ class StreamingService:
         broker_manager = await get_broker_manager()
         broker = broker_manager.get_or_create_broker(run_id)
         if broker:
-            await broker.put(event_id, ("end", {"status": "cancelled"}))
+            await broker.put(event_id, ("end", {"status": "interrupted"}))
 
         broker_manager.cleanup_broker(run_id)
 
@@ -167,7 +179,7 @@ class StreamingService:
         broker = broker_manager.get_or_create_broker(run_id)
         if broker:
             await broker.put(
-                event_id, ("end", {"status": "failed", "error": error_message})
+                event_id, ("end", {"status": "error", "error": error_message})
             )
 
         broker_manager.cleanup_broker(run_id)
@@ -185,12 +197,6 @@ class StreamingService:
         """Stream run execution with unified producer-consumer pattern"""
         run_id = run.run_id
         try:
-            # Send metadata event first (sequence 0, not stored)
-            if not last_event_id:
-                event_id = generate_event_id(run_id, 0)
-                metadata_event = create_metadata_event(run_id, event_id)
-                yield metadata_event
-
             # Replay stored events first
             last_sent_sequence = 0
             if last_event_id:
@@ -235,10 +241,7 @@ class StreamingService:
         broker = broker_manager.get_or_create_broker(run_id)
 
         # If run finished and broker is done, nothing to stream
-        if (
-            run.status in ["completed", "failed", "cancelled", "interrupted"]
-            and broker.is_finished()
-        ):
+        if run.status in ["success", "error", "interrupted"] and broker.is_finished():
             return
 
         # Stream live events
@@ -282,10 +285,10 @@ class StreamingService:
             return False
 
     async def cancel_run(self, run_id: str) -> bool:
-        """Cancel a pending or running execution"""
+        """Cancel a pending or running execution - uses standard status"""
         try:
             await self.signal_run_cancelled(run_id)
-            await self._update_run_status(run_id, "cancelled")
+            await self._update_run_status(run_id, "interrupted")  # Standard status
             return True
         except Exception as e:
             logger.error(f"Error cancelling run {run_id}: {e}")
