@@ -1,6 +1,7 @@
 """Health check endpoints"""
 
 import contextlib
+import os
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
@@ -16,6 +17,7 @@ class HealthResponse(BaseModel):
     database: str
     langgraph_checkpointer: str
     langgraph_store: str
+    redis: str
 
 
 class InfoResponse(BaseModel):
@@ -51,6 +53,7 @@ async def health_check() -> dict[str, str]:
         "database": "unknown",
         "langgraph_checkpointer": "unknown",
         "langgraph_store": "unknown",
+        "redis": "unknown",
     }
 
     # Database connectivity
@@ -88,6 +91,20 @@ async def health_check() -> dict[str, str]:
     except Exception as e:
         health_status["langgraph_store"] = f"error: {str(e)}"
         health_status["status"] = "unhealthy"
+
+    # Redis connectivity (optional - only if STREAMING_BACKEND=redis)
+    streaming_backend = os.getenv("STREAMING_BACKEND", "redis").lower()
+    if streaming_backend == "redis":
+        try:
+            redis_client = await db_manager.get_redis_client()
+            await redis_client.ping()
+            health_status["redis"] = "connected"
+        except Exception as e:
+            health_status["redis"] = f"error: {str(e)}"
+            # Redis is optional with fallback, so don't mark as unhealthy
+            health_status["redis"] = f"unavailable (fallback to memory): {str(e)}"
+    else:
+        health_status["redis"] = "disabled (using memory broker)"
 
     if health_status["status"] == "unhealthy":
         raise HTTPException(status_code=503, detail="Service unhealthy")
